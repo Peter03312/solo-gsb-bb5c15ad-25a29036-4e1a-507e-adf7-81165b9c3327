@@ -308,6 +308,27 @@ CREATE INDEX IF NOT EXISTS idx_notifications_rehearsal ON schedule_notifications
 
 -- 批次接收人（生成时冻结的当时参与演员及其角色）；confirmed_at 为空 = 待确认。
 -- 确认幂等：重试返回首次确认时间；过期（非 current）批次的确认被拒绝。
+-- 换版预演：导演选定目标版本后、正式提交换版前的“预演结果”凭证。
+--   * 预演本身只读：不改写版本、确认、日程、签到快照或通知；仅在此表留下一条凭证。
+--   * token 供“凭预演结果提交换版”使用：提交时重算 state_hash，
+--     与预演时不一致（版本/派角/相关日程/参与演员不可用记录变化）即拒绝并要求重新预演。
+--   * result_hash 为预演结果（确认/日程/参与演员/通知/冲突投影）指纹，提交成功须与预演一致。
+--   * consumed_at：成功提交后标记；过期（expires_at）或已使用的令牌不能再提交。
+CREATE TABLE IF NOT EXISTS version_switch_previews (
+  id               INTEGER PRIMARY KEY,
+  rehearsal_id     INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  from_version_id  INTEGER NOT NULL,
+  target_version_id INTEGER NOT NULL,
+  token            TEXT NOT NULL UNIQUE,
+  state_hash       TEXT NOT NULL,
+  result_hash      TEXT NOT NULL,
+  created_by       INTEGER REFERENCES users(id),
+  created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at       TEXT NOT NULL,
+  consumed_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_switch_previews_rehearsal ON version_switch_previews(rehearsal_id);
+
 CREATE TABLE IF NOT EXISTS schedule_notification_recipients (
   id              INTEGER PRIMARY KEY,
   notification_id INTEGER NOT NULL REFERENCES schedule_notifications(id) ON DELETE CASCADE,
@@ -317,3 +338,101 @@ CREATE TABLE IF NOT EXISTS schedule_notification_recipients (
   UNIQUE (notification_id, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_notification_recipients_actor ON schedule_notification_recipients(actor_id);
+
+-- 换版预演的“状态变化序号”：单调递增，任何影响预演结论的写操作都 bump 一次。
+-- 仅靠内容快照无法识别“预演后增改、提交前又改回原样”的中途变化，
+-- 因此预演凭证同时快照这些序号，提交时逐一比对，序号前进即视为过期（需重新预演）。
+-- scope（按变化实体细分，避免无关变化误伤）：
+--   seq:ver:<rehearsalId>    排练固定版本变化
+--   seq:cast:<rehearsalId>   派角新增/改派/撤派
+--   seq:conf:<rehearsalId>   本排练台词确认变化（只影响本排练的预演结论）
+--   seq:sched:<rehearsalId>  日程增改/取消/待调整
+--   seq:unavail:<actorId>    演员不可用记录登记/修改/撤销
+CREATE TABLE IF NOT EXISTS state_sequences (
+  scope    TEXT PRIMARY KEY,
+  seq      INTEGER NOT NULL DEFAULT 0,
+  bumped_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_rehearsal_update
+AFTER UPDATE OF version_id ON rehearsals
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:ver:' || NEW.id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_cast_insert
+AFTER INSERT ON rehearsal_cast
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:cast:' || NEW.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_cast_update
+AFTER UPDATE ON rehearsal_cast
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:cast:' || NEW.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_cast_delete
+AFTER DELETE ON rehearsal_cast
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:cast:' || OLD.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_confirmation_insert
+AFTER INSERT ON confirmations
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:conf:' || NEW.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_confirmation_update
+AFTER UPDATE ON confirmations
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:conf:' || NEW.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_confirmation_delete
+AFTER DELETE ON confirmations
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:conf:' || OLD.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_schedule_insert
+AFTER INSERT ON rehearsal_schedules
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:sched:' || NEW.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_schedule_update
+AFTER UPDATE ON rehearsal_schedules
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:sched:' || NEW.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_schedule_delete
+AFTER DELETE ON rehearsal_schedules
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:sched:' || OLD.rehearsal_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_seq_unavailability_insert
+AFTER INSERT ON actor_unavailability
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:unavail:' || NEW.actor_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_unavailability_update
+AFTER UPDATE ON actor_unavailability
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:unavail:' || NEW.actor_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_seq_unavailability_delete
+AFTER DELETE ON actor_unavailability
+BEGIN
+  INSERT INTO state_sequences (scope, seq) VALUES ('seq:unavail:' || OLD.actor_id, 1)
+    ON CONFLICT(scope) DO UPDATE SET seq = seq + 1, bumped_at = excluded.bumped_at;
+END;

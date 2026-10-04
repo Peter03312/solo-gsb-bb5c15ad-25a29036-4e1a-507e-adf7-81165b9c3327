@@ -134,8 +134,11 @@ function slotKey(x) {
 /**
  * 冲突检测：候选时段的参与演员，与其他“有效”时段（未取消且非待调整）重叠即冲突。
  * 返回按“演员 × 时段对”去重后的冲突列表。
+ *
+ * options.excludeRehearsalId：换版预演（只读）时，该排练的有效时段尚未真正标记为
+ * 待调整/重算，需整体从“他方时段”中排除（它们均以候选身份参与两两比较）。
  */
-function findScheduleConflicts(candidates) {
+function findScheduleConflicts(candidates, { excludeRehearsalId = null } = {}) {
   const conflicts = [];
   const seen = new Set();
   const push = (actorId, a, b) => {
@@ -165,7 +168,7 @@ function findScheduleConflicts(candidates) {
 
   // 候选与库中其它有效时段比较（跨排练、跨剧本：同一演员不能同时出现在两处）
   const candidateIds = new Set(candidates.map((c) => c.scheduleId).filter((id) => id != null));
-  const others = db
+  let others = db
     .prepare(
       `SELECT s.*, r.version_id, r.name AS rehearsal_name
          FROM rehearsal_schedules s
@@ -173,6 +176,9 @@ function findScheduleConflicts(candidates) {
         WHERE s.status = 'active'`
     )
     .all();
+  if (excludeRehearsalId != null) {
+    others = others.filter((s) => s.rehearsal_id !== excludeRehearsalId);
+  }
   const partCache = new Map();
   const actorsOf = (row) => {
     if (!partCache.has(row.id)) {
@@ -194,8 +200,12 @@ function findScheduleConflicts(candidates) {
   return conflicts;
 }
 
-function assertNoScheduleConflicts(candidates, message = '参与演员与其他未取消时段重叠，本次操作未生效') {
-  const conflicts = findScheduleConflicts(candidates);
+function assertNoScheduleConflicts(
+  candidates,
+  message = '参与演员与其他未取消时段重叠，本次操作未生效',
+  options = {}
+) {
+  const conflicts = findScheduleConflicts(candidates, options);
   if (conflicts.length) throw conflict('SCHEDULE_CONFLICT', message, { conflicts });
 }
 
@@ -290,7 +300,11 @@ function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
       versionId: newVersionId,
     })
   );
-  assertNoScheduleConflicts(candidates, '换版后参与演员与其他未取消时段重叠，本次换版未生效');
+  assertNoScheduleConflicts(
+    candidates,
+    '换版后参与演员与其他未取消时段重叠，本次换版未生效',
+    { excludeRehearsalId: rehearsalId }
+  );
   assertNoUnavailabilityConflicts(candidates, '换版后参与演员与其登记的不可用时段相撞，本次换版未生效');
   return needsAdjustment;
 }
@@ -707,4 +721,8 @@ module.exports = {
   participantDetails,
   parseTzDateTime,
   slotRef,
+  buildCandidate,
+  findScheduleConflicts,
+  findUnavailabilityConflicts,
+  notificationFingerprint,
 };
