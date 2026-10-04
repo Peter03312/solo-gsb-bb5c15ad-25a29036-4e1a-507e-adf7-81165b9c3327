@@ -949,6 +949,160 @@ async function main() {
   const rhN2View = await G(`/api/rehearsals/${rhN2}`, director);
   check('台词逐场确认不受通知影响', !rhN2View.pending.some((p) => p.actorId === linId && p.sceneId === n1));
 
+  console.log('— 换版预演：确认/日程/参与者与通知接收人变化、只读 —');
+  // RH_P 固定 pv2：甲=林晚、乙=陈默；sc1/sc2 各一段日程；林晚确认 sc1/sc2（甲在两场均有台词）
+  const rhP = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '预演排练P' }, 201)).id;
+  await J(`/api/rehearsals/${rhP}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhP}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const sp1 = (await J(`/api/rehearsals/${rhP}/schedules`, director, { sceneId: sc1, startAt: '2034-01-01T10:00:00+08:00', endAt: '2034-01-01T11:00:00+08:00' }, 201)).schedule;
+  const sp2 = (await J(`/api/rehearsals/${rhP}/schedules`, director, { sceneId: sc2, startAt: '2034-01-02T10:00:00+08:00', endAt: '2034-01-02T11:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhP}/confirm`, lin, { roleId: roleA, sceneId: sc1 }, 200);
+  await J(`/api/rehearsals/${rhP}/confirm`, lin, { roleId: roleA, sceneId: sc2 }, 200);
+
+  // 预演 pv2 -> pv3（pv3 删除了 sc2 全部台词）
+  const prevP = await J(`/api/rehearsals/${rhP}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  check('预演返回令牌与版本信息', !!prevP.previewToken && prevP.fromVersion.id === pv2 && prevP.toVersion.id === pv3);
+  check('预演：文本未变的确认保留（sc1 甲）', prevP.confirmations.kept.some((c) => c.actorId === linId && c.sceneId === sc1), JSON.stringify(prevP.confirmations));
+  check('预演：无台词场次的确认将重做（sc2 甲）', prevP.confirmations.redone.some((c) => c.actorId === linId && c.sceneId === sc2));
+  const prevSp1 = prevP.schedules.find((s) => s.id === sp1.id);
+  const prevSp2 = prevP.schedules.find((s) => s.id === sp2.id);
+  check('预演：sc1 日程继续有效、sc2 日程将转待调整',
+    prevSp1?.afterStatus === 'active' && prevSp2?.afterStatus === 'needs_adjustment' && prevP.needsAdjustmentSchedules.includes(sp2.id));
+  check('预演：转待调整日程参与者将退出、当前通知批次将失效',
+    prevSp2.participantsRemoved.length === 2 && prevSp2.notification.willBecomeInactive === true);
+  check('预演：继续有效日程将生成新通知批次', prevSp1.notification.willGenerateBatch === true);
+  check('预演：无冲突可提交', prevP.canCommit === true && prevP.conflicts.schedule.length === 0 && prevP.conflicts.unavailability.length === 0);
+
+  // 预演为只读：版本/确认/日程/通知均不变
+  const rhPAfterPrev = await G(`/api/rehearsals/${rhP}`, director);
+  check('预演不改写排练版本与确认', rhPAfterPrev.rehearsal.versionId === pv2 && !rhPAfterPrev.pending.some((p) => p.actorId === linId));
+  check('预演不改写日程状态', (await G(`/api/rehearsals/${rhP}/schedules`, director)).schedules.every((s) => s.status === 'active'));
+  const sp1Notif0 = await G(`/api/rehearsals/${rhP}/schedules/${sp1.id}/notifications`, director);
+  check('预演不生成新通知批次', sp1Notif0.current.seq === 1 && sp1Notif0.history.length === 0);
+  // 越权与无效目标
+  await J(`/api/rehearsals/${rhP}/switch-version/preview`, lin, { versionId: pv3 }, 403);
+  await J(`/api/rehearsals/${rhP}/switch-version/preview`, director, { versionId: 99999 }, 400);
+  await J(`/api/rehearsals/${rhP}/switch-version/preview`, director, { versionId: pv2 }, 400);
+  await J(`/api/rehearsals/${rhP}/switch-version/preview`, director, {}, 400);
+  check('预演：演员 403；无效版本/当前版本/缺参 400', true);
+
+  console.log('— 凭预演提交换版：成功与预演一致、签到快照不变 —');
+  const commitP = await J(`/api/rehearsals/${rhP}/switch-version/commit`, director, { versionId: pv3, previewToken: prevP.previewToken }, 200);
+  check('提交成功，版本已切换', commitP.rehearsal.versionId === pv3);
+  check('提交结果与预演一致（确认/待调整日程）',
+    commitP.preview.confirmations.kept.length === prevP.confirmations.kept.length
+    && commitP.preview.confirmations.redone.length === prevP.confirmations.redone.length
+    && JSON.stringify(commitP.needsAdjustmentSchedules) === JSON.stringify(prevP.needsAdjustmentSchedules),
+    JSON.stringify(commitP.needsAdjustmentSchedules));
+  check('提交后 sc2 日程已转待调整', (await G(`/api/rehearsals/${rhP}/schedules?status=needs_adjustment`, director)).schedules.some((s) => s.id === sp2.id));
+  check('提交后 sc1 确认保留（林晚无待确认）', !commitP.pending.some((p) => p.actorId === linId));
+  // 换回 pv2（原接口）：sc2 确认已在换版中作废 -> 需重新确认；sc1 确认保留
+  const swBack = await J(`/api/rehearsals/${rhP}/switch-version`, director, { versionId: pv2 }, 200);
+  check('原换版接口响应结构保持不变', swBack.ok === true && !!swBack.rehearsal && Array.isArray(swBack.pending)
+    && Array.isArray(swBack.needsAdjustmentSchedules) && swBack.preview === undefined);
+  check('sc2 确认已作废（换回后需重新确认）', swBack.pending.some((p) => p.actorId === linId && p.sceneId === sc2));
+  check('sc1 确认保留（换回后仍无需确认）', !swBack.pending.some((p) => p.actorId === linId && p.sceneId === sc1));
+  // 已开启的签到快照在凭预演提交换版后保持不变
+  const attP = (await J(`/api/rehearsals/${rhP}/schedules/${sp1.id}/attendance`, director, {}, 201)).session;
+  const prevP2 = await J(`/api/rehearsals/${rhP}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  const sp1SeqBefore = (await G(`/api/rehearsals/${rhP}/schedules/${sp1.id}/notifications`, director)).current.seq;
+  await J(`/api/rehearsals/${rhP}/switch-version/commit`, director, { versionId: pv3, previewToken: prevP2.previewToken }, 200);
+  const attPAfter = (await G(`/api/rehearsals/${rhP}/schedules/${sp1.id}/attendance`, director)).session;
+  check('凭预演提交换版不改写签到快照', attPAfter.versionId === attP.versionId && attPAfter.startAt === attP.startAt
+    && attPAfter.roster.length === 2 && attPAfter.stats.expected === 2, JSON.stringify(attPAfter.stats));
+  check('凭预演提交换版生成新通知批次（冻结新版本）',
+    (await G(`/api/rehearsals/${rhP}/schedules/${sp1.id}/notifications`, director)).current.seq === sp1SeqBefore + 1);
+
+  console.log('— 凭预演提交：预演后状态变化即过期（PREVIEW_STALE） —');
+  const rhP2 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '预演排练P2' }, 201)).id;
+  await J(`/api/rehearsals/${rhP2}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  // 预演后改派角 -> 过期
+  const stale1 = await J(`/api/rehearsals/${rhP2}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  await J(`/api/rehearsals/${rhP2}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const staleCommit1 = await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3, previewToken: stale1.previewToken }, 409);
+  check('预演后改派角 -> 提交过期拒绝', staleCommit1.error === 'PREVIEW_STALE', JSON.stringify(staleCommit1));
+  check('过期提交不改变版本', (await G(`/api/rehearsals/${rhP2}`, director)).rehearsal.versionId === pv2);
+  // 预演后改日程 -> 过期
+  const stale2 = await J(`/api/rehearsals/${rhP2}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  await J(`/api/rehearsals/${rhP2}/schedules`, director, { sceneId: sc1, startAt: '2034-02-01T10:00:00+08:00', endAt: '2034-02-01T11:00:00+08:00' }, 201);
+  const staleCommit2 = await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3, previewToken: stale2.previewToken }, 409);
+  check('预演后改日程 -> 提交过期拒绝', staleCommit2.error === 'PREVIEW_STALE');
+  // 预演后参与演员登记不可用 -> 过期
+  const stale3 = await J(`/api/rehearsals/${rhP2}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  const unStale = (await J('/api/me/unavailability', lin, { startAt: '2034-05-01T10:00:00+08:00', endAt: '2034-05-01T11:00:00+08:00', reason: '过期测试' }, 201)).unavailability;
+  const staleCommit3 = await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3, previewToken: stale3.previewToken }, 409);
+  check('预演后参与演员不可用记录变化 -> 提交过期拒绝', staleCommit3.error === 'PREVIEW_STALE');
+  await D(`/api/me/unavailability/${unStale.id}`, lin, 200);
+  // 预演后确认变化 -> 过期
+  const stale4 = await J(`/api/rehearsals/${rhP2}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  await J(`/api/rehearsals/${rhP2}/confirm`, lin, { roleId: roleA, sceneId: sc1 }, 200);
+  const staleCommit4 = await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3, previewToken: stale4.previewToken }, 409);
+  check('预演后确认变化 -> 提交过期拒绝', staleCommit4.error === 'PREVIEW_STALE');
+  // 缺令牌 400；错令牌 409；演员 403
+  await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3 }, 400);
+  const badToken = await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3, previewToken: 'deadbeef' }, 409);
+  check('缺令牌 400；错令牌 409 PREVIEW_STALE', badToken.error === 'PREVIEW_STALE');
+  await J(`/api/rehearsals/${rhP2}/switch-version/commit`, lin, { versionId: pv3, previewToken: stale4.previewToken }, 403);
+  check('演员提交 403', true);
+  // 重新预演后正常提交
+  const okPrev = await J(`/api/rehearsals/${rhP2}/switch-version/preview`, director, { versionId: pv3 }, 200);
+  const okCommit = await J(`/api/rehearsals/${rhP2}/switch-version/commit`, director, { versionId: pv3, previewToken: okPrev.previewToken }, 200);
+  check('重新预演后提交成功', okCommit.rehearsal.versionId === pv3);
+
+  console.log('— 凭预演提交：提交时存在冲突整次不生效 —');
+  // RH_P3 固定 pv1：甲=周海、乙=林晚（pv1 乙在 sc1 无台词）；sp3 = sc1 10:00-11:00（参与者仅周海）
+  const rhP3 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '预演排练P3' }, 201)).id;
+  await J(`/api/rehearsals/${rhP3}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  await J(`/api/rehearsals/${rhP3}/cast`, director, { roleId: roleB, actorId: linId }, 201);
+  const sp3 = (await J(`/api/rehearsals/${rhP3}/schedules`, director, { sceneId: sc1, startAt: '2034-03-01T10:00:00+08:00', endAt: '2034-03-01T11:00:00+08:00' }, 201)).schedule;
+  // RH_P4 固定 pv2：甲=陈默；sp4 = sc1 10:30-11:30（与 sp3 重叠但参与者不同）
+  const rhP4 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '预演排练P4' }, 201)).id;
+  await J(`/api/rehearsals/${rhP4}/cast`, director, { roleId: roleA, actorId: chenId }, 201);
+  const sp4 = (await J(`/api/rehearsals/${rhP4}/schedules`, director, { sceneId: sc1, startAt: '2034-03-01T10:30:00+08:00', endAt: '2034-03-01T11:30:00+08:00' }, 201)).schedule;
+  // 预演 RH_P3 -> pv2：乙进入 sc1（参与者 +林晚）；与 sp4（陈默）不冲突
+  const prevP3 = await J(`/api/rehearsals/${rhP3}/switch-version/preview`, director, { versionId: pv2 }, 200);
+  const prevSp3 = prevP3.schedules.find((s) => s.id === sp3.id);
+  check('预演参与者变化：乙加入 sc1 参与者', prevSp3.participantsAdded.some((p) => p.actorId === linId), JSON.stringify(prevSp3.participantsAdded));
+  check('预演通知接收人变化：新批次将含林晚', prevSp3.notification.recipientsAdded.some((a) => a.actorId === linId));
+  check('预演时无冲突可提交', prevP3.canCommit === true);
+  // 预演后：其他排练 RH_P4 改派 甲 陈默->林晚（不使令牌过期，但引入冲突）
+  await J(`/api/rehearsals/${rhP4}/cast`, director, { roleId: roleA, actorId: linId }, 200);
+  const cfCommit = await J(`/api/rehearsals/${rhP3}/switch-version/commit`, director, { versionId: pv2, previewToken: prevP3.previewToken }, 409);
+  check('提交时存在冲突 -> 整次不生效并返回冲突详情', cfCommit.error === 'SCHEDULE_CONFLICT'
+    && cfCommit.details.conflicts.some((c) => c.actorId === linId && c.overlapsWith.id === sp4.id), JSON.stringify(cfCommit.details));
+  check('冲突提交不改变版本', (await G(`/api/rehearsals/${rhP3}`, director)).rehearsal.versionId === pv1);
+  // 再预演：应列出冲突，canCommit=false；带冲突的预演令牌提交仍返回冲突
+  const prevP3b = await J(`/api/rehearsals/${rhP3}/switch-version/preview`, director, { versionId: pv2 }, 200);
+  check('预演列出与其他有效日程的冲突', prevP3b.canCommit === false
+    && prevP3b.conflicts.schedule.some((c) => c.actorId === linId && c.overlapsWith.id === sp4.id), JSON.stringify(prevP3b.conflicts));
+  const cfCommit2 = await J(`/api/rehearsals/${rhP3}/switch-version/commit`, director, { versionId: pv2, previewToken: prevP3b.previewToken }, 409);
+  check('带冲突的预演提交仍返回冲突详情', cfCommit2.error === 'SCHEDULE_CONFLICT');
+  // 取消冲突时段后重新预演可提交
+  await J(`/api/rehearsals/${rhP4}/schedules/${sp4.id}/cancel`, director, {}, 200);
+  const prevP3c = await J(`/api/rehearsals/${rhP3}/switch-version/preview`, director, { versionId: pv2 }, 200);
+  check('冲突解除后预演可提交', prevP3c.canCommit === true);
+  const cfCommit3 = await J(`/api/rehearsals/${rhP3}/switch-version/commit`, director, { versionId: pv2, previewToken: prevP3c.previewToken }, 200);
+  check('冲突解除后提交成功', cfCommit3.rehearsal.versionId === pv2);
+
+  console.log('— 换版预演：不可用时段冲突 —');
+  // RH_P5 固定 pv1：甲=周海、乙=林晚；sp5 = sc1；林晚登记重叠不可用（她当前不是 sp5 参与者）
+  const rhP5 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '预演排练P5' }, 201)).id;
+  await J(`/api/rehearsals/${rhP5}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  await J(`/api/rehearsals/${rhP5}/cast`, director, { roleId: roleB, actorId: linId }, 201);
+  const sp5 = (await J(`/api/rehearsals/${rhP5}/schedules`, director, { sceneId: sc1, startAt: '2034-04-01T10:00:00+08:00', endAt: '2034-04-01T11:00:00+08:00' }, 201)).schedule;
+  const unP5 = (await J('/api/me/unavailability', lin, { startAt: '2034-04-01T10:30:00+08:00', endAt: '2034-04-01T11:30:00+08:00', reason: '预演不可用测试' }, 201)).unavailability;
+  const prevP5 = await J(`/api/rehearsals/${rhP5}/switch-version/preview`, director, { versionId: pv2 }, 200);
+  check('预演列出不可用冲突', prevP5.canCommit === false
+    && prevP5.conflicts.unavailability.some((c) => c.actorId === linId && c.schedule.id === sp5.id && c.unavailability.id === unP5.id),
+    JSON.stringify(prevP5.conflicts));
+  const unCommit = await J(`/api/rehearsals/${rhP5}/switch-version/commit`, director, { versionId: pv2, previewToken: prevP5.previewToken }, 409);
+  check('不可用冲突提交整次不生效', unCommit.error === 'UNAVAILABILITY_CONFLICT'
+    && (await G(`/api/rehearsals/${rhP5}`, director)).rehearsal.versionId === pv1);
+  await D(`/api/me/unavailability/${unP5.id}`, lin, 200);
+  const prevP5b = await J(`/api/rehearsals/${rhP5}/switch-version/preview`, director, { versionId: pv2 }, 200);
+  const okCommit5 = await J(`/api/rehearsals/${rhP5}/switch-version/commit`, director, { versionId: pv2, previewToken: prevP5b.previewToken }, 200);
+  check('撤销不可用后提交成功', okCommit5.rehearsal.versionId === pv2);
+
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 }

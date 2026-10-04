@@ -256,16 +256,15 @@ function assertRehearsalSchedulesAfterCastChange(rehearsalId) {
 }
 
 /**
- * 换版后日程处理（须在换版事务内调用，抛错即整体回滚，版本与确认不变）：
- *   - 新版本中该场次已无台词的既有安排 -> 标为“待调整”，不参与冲突检测；
- *   - 其余有效时段按新版本重算参与者，与其他未取消时段重叠 -> 抛 409。
- * 返回被标为待调整的时段 id 列表。
+ * 换版日程计划（纯计算，不写库；换版预演与正式换版共用同一套判定）：
+ *   - 新版本中该场次已无台词的既有有效安排 -> 将标为“待调整”，不参与冲突检测；
+ *   - 其余有效时段按新版本重算参与者，构造冲突检测候选。
+ * 返回 { needsAdjustment: [日程行], stillActive: [日程行], candidates: [候选] }。
  */
-function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
+function planSchedulesForVersionSwitch(rehearsalId, newVersionId) {
   const rows = db
     .prepare("SELECT * FROM rehearsal_schedules WHERE rehearsal_id = ? AND status = 'active'")
     .all(rehearsalId);
-  if (!rows.length) return [];
   const rehearsal = db.prepare('SELECT * FROM rehearsals WHERE id = ?').get(rehearsalId);
   const needsAdjustment = [];
   const stillActive = [];
@@ -273,12 +272,8 @@ function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
     const hasLines = db
       .prepare('SELECT 1 FROM version_lines WHERE version_id = ? AND scene_id = ? LIMIT 1')
       .get(newVersionId, s.scene_id);
-    if (!hasLines) {
-      db.prepare("UPDATE rehearsal_schedules SET status = 'needs_adjustment' WHERE id = ?").run(s.id);
-      needsAdjustment.push(s.id);
-    } else {
-      stillActive.push(s);
-    }
+    if (hasLines) stillActive.push(s);
+    else needsAdjustment.push(s);
   }
   const candidates = stillActive.map((s) =>
     buildCandidate({
@@ -290,9 +285,23 @@ function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
       versionId: newVersionId,
     })
   );
+  return { needsAdjustment, stillActive, candidates };
+}
+
+/**
+ * 换版后日程处理（须在换版事务内调用，抛错即整体回滚，版本与确认不变）：
+ *   - 新版本中该场次已无台词的既有安排 -> 标为“待调整”，不参与冲突检测；
+ *   - 其余有效时段按新版本重算参与者，与其他未取消时段重叠 -> 抛 409。
+ * 返回被标为待调整的时段 id 列表。
+ */
+function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
+  const { needsAdjustment, candidates } = planSchedulesForVersionSwitch(rehearsalId, newVersionId);
+  for (const s of needsAdjustment) {
+    db.prepare("UPDATE rehearsal_schedules SET status = 'needs_adjustment' WHERE id = ?").run(s.id);
+  }
   assertNoScheduleConflicts(candidates, '换版后参与演员与其他未取消时段重叠，本次换版未生效');
   assertNoUnavailabilityConflicts(candidates, '换版后参与演员与其登记的不可用时段相撞，本次换版未生效');
-  return needsAdjustment;
+  return needsAdjustment.map((s) => s.id);
 }
 
 // ---- 时段通知批次（知悉确认）：生成逻辑；查询与演员确认见 notifications.js ----
@@ -703,6 +712,9 @@ module.exports = {
   router,
   assertRehearsalSchedulesAfterCastChange,
   applySchedulesAfterVersionSwitch,
+  planSchedulesForVersionSwitch,
+  findScheduleConflicts,
+  findUnavailabilityConflicts,
   syncScheduleNotifications,
   participantDetails,
   parseTzDateTime,

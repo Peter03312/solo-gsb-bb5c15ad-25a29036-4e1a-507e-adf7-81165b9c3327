@@ -143,13 +143,19 @@ function renderRehearsalDetail(data, reload) {
     <div class="flex" style="margin:8px 0">
       <strong>固定版本 v${rehearsal.versionNo}</strong>
       <select class="switchVer" style="max-width:200px"></select>
+      <button class="btn small previewBtn">预演换版</button>
       <button class="btn small switchBtn">显式换版</button>
     </div>
+    <div class="switchPreview"></div>
     <div class="verLog muted"></div>`);
   api('GET', `/api/plays/${rehearsal.playId}/versions`).then(({ versions }) => {
     ver.querySelector('.switchVer').innerHTML = versions
       .map((v) => `<option value="${v.id}" ${v.id === rehearsal.versionId ? 'disabled' : ''}>v${v.versionNo}${v.id === rehearsal.versionId ? '（当前）' : ''}</option>`)
       .join('');
+  });
+  ver.querySelector('.previewBtn').addEventListener('click', () => {
+    const vid = Number(ver.querySelector('.switchVer').value);
+    showSwitchPreview(ver.querySelector('.switchPreview'), rehearsal, vid);
   });
   ver.querySelector('.switchBtn').addEventListener('click', async () => {
     const vid = Number(ver.querySelector('.switchVer').value);
@@ -270,6 +276,95 @@ function renderRehearsalDetail(data, reload) {
 async function loadActors() {
   // 导演可通过演员列表接口获取；若未暴露则从后端 dashboard 不可得，这里走专用端点
   return (await api('GET', '/api/actors')).actors;
+}
+
+/** 导演：换版预演（只读）——确认保留/重做、日程去向、参与者与通知接收人变化、冲突；可凭预演令牌提交 */
+async function showSwitchPreview(box, rehearsal, versionId) {
+  box.innerHTML = '<span class="muted">预演中…</span>';
+  let p;
+  try {
+    p = await api('POST', `/api/rehearsals/${rehearsal.id}/switch-version/preview`, { versionId });
+  } catch (err) {
+    box.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+    return;
+  }
+  const names = (list) => list.map((a) => esc(a.actorName)).join('、');
+  const confRows = (list, tag) =>
+    list
+      .map(
+        (c) =>
+          `<div class="muted">${tag}：${esc(c.actorName)} · ${esc(c.roleName)} · ${esc(c.sceneTitle)}` +
+          `${c.reason ? `（${esc(c.reason)}）` : ''}</div>`
+      )
+      .join('');
+  const schedRows = p.schedules
+    .map((s) => {
+      const parts = [
+        s.afterStatus === 'needs_adjustment'
+          ? '<span class="badge pending">将转为待调整</span>'
+          : '<span class="badge done">继续有效</span>',
+      ];
+      if (s.participantsAdded.length) parts.push(`新增参与者：${names(s.participantsAdded)}`);
+      if (s.participantsRemoved.length) parts.push(`退出参与者：${names(s.participantsRemoved)}`);
+      if (s.notification?.willBecomeInactive) parts.push('当前通知批次将失效');
+      else if (s.notification?.willGenerateBatch) {
+        const n = [];
+        if (s.notification.recipientsAdded?.length) n.push(`新增接收人：${names(s.notification.recipientsAdded)}`);
+        if (s.notification.recipientsRemoved?.length) n.push(`移除接收人：${names(s.notification.recipientsRemoved)}`);
+        parts.push(`将生成新通知批次（第 ${(s.notification.currentSeq ?? 0) + 1} 批）${n.length ? `：${n.join('；')}` : ''}`);
+      }
+      return `<div>#${s.id} ${esc(s.sceneTitle || '')} · ${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}：${parts.join('；')}</div>`;
+    })
+    .join('');
+  const conflictRows = [
+    ...p.conflicts.schedule.map(
+      (c) =>
+        `<div>日程冲突：${esc(c.actorName)} · ${esc(c.schedule?.sceneTitle || '时段')} 与「${esc(c.overlapsWith?.rehearsalName || '')}」` +
+        `${esc(c.overlapsWith?.sceneTitle || '时段')} ${c.overlapsWith?.startAt ? fmtTime(c.overlapsWith.startAt) : ''}→${c.overlapsWith?.endAt ? fmtTime(c.overlapsWith.endAt) : ''} 重叠</div>`
+    ),
+    ...p.conflicts.unavailability.map(
+      (c) =>
+        `<div>不可用冲突：${esc(c.actorName)} · ${esc(c.schedule?.sceneTitle || '时段')} 撞上不可用 ` +
+        `${c.unavailability ? `${fmtTime(c.unavailability.startAt)}→${fmtTime(c.unavailability.endAt)}${c.unavailability.reason ? `（${esc(c.unavailability.reason)}）` : ''}` : ''}</div>`
+    ),
+  ].join('');
+  box.innerHTML = `
+    <div class="conflict" style="border-color:#8ca3b9;background:#f4f7fa">
+      <div class="kind" style="color:#2b2620">换版预演：v${p.fromVersion.versionNo} → v${p.toVersion.versionNo}
+        <span class="badge ${p.canCommit ? 'done' : 'pending'}">${p.canCommit ? '无冲突，可提交' : '存在冲突，暂不可提交'}</span></div>
+      <div class="muted">预演为只读，不改变任何数据；提交前若排练版本、派角、确认、相关日程或参与演员的不可用记录变化，需重新预演。</div>
+      <div style="margin-top:4px"><strong>确认：</strong>保留 ${p.confirmations.kept.length} 条，重做 ${p.confirmations.redone.length} 条</div>
+      ${confRows(p.confirmations.redone, '重做')}
+      <div style="margin-top:4px"><strong>有效日程：</strong></div>
+      ${schedRows || '<div class="muted">无有效日程</div>'}
+      ${conflictRows ? `<div style="margin-top:4px"><strong>冲突：</strong></div>${conflictRows}` : ''}
+      <div class="flex" style="margin-top:6px">
+        ${p.canCommit ? '<button class="btn small primary commitSwitch">按预演结果提交换版</button>' : ''}
+        <button class="btn small closePreview">收起预演</button>
+      </div>
+    </div>`;
+  box.querySelector('.closePreview').addEventListener('click', () => { box.innerHTML = ''; });
+  const commitBtn = box.querySelector('.commitSwitch');
+  if (commitBtn) {
+    commitBtn.addEventListener('click', async () => {
+      try {
+        const r = await api('POST', `/api/rehearsals/${rehearsal.id}/switch-version/commit`, {
+          versionId,
+          previewToken: p.previewToken,
+        });
+        const adj = r.needsAdjustmentSchedules?.length ? `；待调整时段 ${r.needsAdjustmentSchedules.length} 个` : '';
+        toast(`已按预演提交换版；待确认 ${r.pending.length} 项${adj}`);
+        toggleRehearsalDetail(rehearsal.id).catch(() => {});
+      } catch (err) {
+        if (err?.data?.error === 'PREVIEW_STALE') {
+          toast('预演已过期：相关状态已变化，请重新预演', true);
+          box.innerHTML = '';
+        } else {
+          toast(scheduleErr(err), true);
+        }
+      }
+    });
+  }
 }
 
 /** 导演日程表“到场登记”列：未开启可开启（仅有效时段）；已开启显示状态与统计 */

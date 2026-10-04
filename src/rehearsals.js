@@ -1,9 +1,18 @@
 const express = require('express');
+const crypto = require('crypto');
 const { db, transaction, roleSceneHash } = require('./db');
-const { badRequest, notFound, forbidden, wrap } = require('./errors');
+const { badRequest, notFound, forbidden, conflict, wrap } = require('./errors');
 const { authRequired, publicUser } = require('./auth');
 const { getPlayOrThrow, getVersionOfPlayOrThrow, formatVersion } = require('./plays');
-const { assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch, syncScheduleNotifications } = require('./schedules');
+const {
+  assertRehearsalSchedulesAfterCastChange,
+  applySchedulesAfterVersionSwitch,
+  planSchedulesForVersionSwitch,
+  findScheduleConflicts,
+  findUnavailabilityConflicts,
+  syncScheduleNotifications,
+  participantDetails,
+} = require('./schedules');
 
 const router = express.Router();
 router.use(authRequired);
@@ -231,6 +240,53 @@ function rehearsalPending(rehearsal, actorIdFilter) {
   return pending;
 }
 
+/**
+ * 换版事务内共用逻辑（显式换版与凭预演提交完全一致）：
+ *   - 仅保留“角色×场次”文本指纹在新旧版本间一致的确认；
+ *     文本变化（含角色在该场次不再有台词）的确认删除，相关角色需重新确认；
+ *   - 更新排练固定版本并写换版日志；
+ *   - 日程：新版本中无台词场次的既有安排标为“待调整”（不计入冲突）；
+ *     其余有效时段按新版本重算参与者，与其他未取消时段重叠则抛 409，
+ *     整个事务回滚——版本与确认均不改变；
+ *   - 时段通知：仍有效的时段按新版本生成新批次（版本变化即实质变化）；
+ *     待调整时段的当前批次不再待确认。与同事务提交，换版失败不留批次。
+ * 返回被标为待调整的时段 id 列表。
+ */
+function applyVersionSwitch(r, targetVersionId, actorId) {
+  const old = r.version_id;
+  const cast = db.prepare('SELECT * FROM rehearsal_cast WHERE rehearsal_id = ?').all(r.id);
+  for (const c of cast) {
+    const newScenes = new Set(
+      db
+        .prepare('SELECT DISTINCT scene_id FROM version_lines WHERE version_id = ? AND role_id = ?')
+        .all(targetVersionId, c.role_id)
+        .map((x) => x.scene_id)
+    );
+    const confirmations = db
+      .prepare('SELECT * FROM confirmations WHERE rehearsal_id = ? AND role_id = ?')
+      .all(r.id, c.role_id);
+    for (const conf of confirmations) {
+      if (!newScenes.has(conf.scene_id)) {
+        db.prepare('DELETE FROM confirmations WHERE id = ?').run(conf.id);
+        continue;
+      }
+      const oldHash = roleSceneHash(old, c.role_id, conf.scene_id);
+      const newHash = roleSceneHash(targetVersionId, c.role_id, conf.scene_id);
+      // 仅保留与旧版内容一致、且新旧内容未变的确认（文本变化角色须重确）
+      if (conf.content_hash !== oldHash || oldHash !== newHash) {
+        db.prepare('DELETE FROM confirmations WHERE id = ?').run(conf.id);
+      }
+    }
+  }
+  db.prepare('UPDATE rehearsals SET version_id = ? WHERE id = ?').run(targetVersionId, r.id);
+  db.prepare(
+    'INSERT INTO rehearsal_version_log (rehearsal_id, from_version_id, to_version_id, actor_id) VALUES (?, ?, ?, ?)'
+  ).run(r.id, old, targetVersionId, actorId);
+  const needsAdjustmentSchedules = applySchedulesAfterVersionSwitch(r.id, targetVersionId);
+  syncScheduleNotifications(r.id, 'version_switch', actorId);
+  return needsAdjustmentSchedules;
+}
+
 // ---- 显式换版 ----
 router.post(
   '/rehearsals/:id/switch-version',
@@ -239,49 +295,12 @@ router.post(
     const r = getRehearsalOrThrow(req.params.id);
     const targetVersionId = Number(req.body?.versionId);
     if (!Number.isInteger(targetVersionId)) throw badRequest('必须显式指定目标版本 versionId');
-    const target = getVersionOfPlayOrThrow(targetVersionId, r.play_id);
+    getVersionOfPlayOrThrow(targetVersionId, r.play_id);
     if (targetVersionId === r.version_id) throw badRequest('排练当前已固定在该版本');
 
     let needsAdjustmentSchedules = [];
     transaction(() => {
-      const old = r.version_id;
-      // 仅保留“角色×场次”文本指纹在新旧版本间一致的确认；
-      // 文本变化（含角色在该场次不再有台词）的确认删除，相关角色需重新确认。
-      const cast = db.prepare('SELECT * FROM rehearsal_cast WHERE rehearsal_id = ?').all(r.id);
-      for (const c of cast) {
-        const newScenes = new Set(
-          db
-            .prepare('SELECT DISTINCT scene_id FROM version_lines WHERE version_id = ? AND role_id = ?')
-            .all(targetVersionId, c.role_id)
-            .map((x) => x.scene_id)
-        );
-        const confirmations = db
-          .prepare('SELECT * FROM confirmations WHERE rehearsal_id = ? AND role_id = ?')
-          .all(r.id, c.role_id);
-        for (const conf of confirmations) {
-          if (!newScenes.has(conf.scene_id)) {
-            db.prepare('DELETE FROM confirmations WHERE id = ?').run(conf.id);
-            continue;
-          }
-          const oldHash = roleSceneHash(old, c.role_id, conf.scene_id);
-          const newHash = roleSceneHash(targetVersionId, c.role_id, conf.scene_id);
-          // 仅保留与旧版内容一致、且新旧内容未变的确认（文本变化角色须重确）
-          if (conf.content_hash !== oldHash || oldHash !== newHash) {
-            db.prepare('DELETE FROM confirmations WHERE id = ?').run(conf.id);
-          }
-        }
-      }
-      db.prepare('UPDATE rehearsals SET version_id = ? WHERE id = ?').run(targetVersionId, r.id);
-      db.prepare(
-        'INSERT INTO rehearsal_version_log (rehearsal_id, from_version_id, to_version_id, actor_id) VALUES (?, ?, ?, ?)'
-      ).run(r.id, old, targetVersionId, req.user.id);
-      // 日程：新版本中无台词场次的既有安排标为“待调整”（不计入冲突）；
-      // 其余有效时段按新版本重算参与者，与其他未取消时段重叠则抛 409，
-      // 整个事务回滚——版本与确认均不改变。
-      needsAdjustmentSchedules = applySchedulesAfterVersionSwitch(r.id, targetVersionId);
-      // 时段通知：仍有效的时段按新版本生成新批次（版本变化即实质变化）；
-      // 待调整时段的当前批次不再待确认。与同事务提交，换版失败不留批次。
-      syncScheduleNotifications(r.id, 'version_switch', req.user.id);
+      needsAdjustmentSchedules = applyVersionSwitch(r, targetVersionId, req.user.id);
     });
 
     res.json({
@@ -289,6 +308,245 @@ router.post(
       rehearsal: serializeRehearsal(getRehearsalOrThrow(r.id)),
       pending: rehearsalPending(getRehearsalOrThrow(r.id), null),
       needsAdjustmentSchedules,
+    });
+  })
+);
+
+/**
+ * 换版影响预演（纯只读计算，不写库：不改写版本、确认、日程、签到快照或通知）：
+ *   - 确认：逐条判定保留还是重做（与正式换版同一套文本指纹规则）；
+ *   - 有效日程：继续有效还是转为待调整；
+ *   - 参与演员与通知接收人：逐时段列出前后名单与增减；
+ *   - 冲突：与其他有效日程、参与演员不可用时段（端点相接不算；已取消与待调整日程不参与）。
+ */
+function computeSwitchPreview(r, targetVersionId) {
+  const old = r.version_id;
+  const versionBrief = (id) => {
+    const v = db.prepare('SELECT * FROM versions WHERE id = ?').get(id);
+    return { id: v.id, versionNo: v.version_no };
+  };
+  const sceneTitleOf = (sceneId) => {
+    const s = db.prepare('SELECT * FROM scenes WHERE id = ?').get(sceneId);
+    return s ? `${s.code} ${s.title}` : `#${sceneId}`;
+  };
+  const roleNameOf = (roleId) =>
+    db.prepare('SELECT name FROM roles WHERE id = ?').get(roleId)?.name ?? `#${roleId}`;
+  const actorNameOf = (actorId) =>
+    db.prepare('SELECT display_name FROM users WHERE id = ?').get(actorId)?.display_name ?? `#${actorId}`;
+
+  // —— 确认：保留还是重做 ——
+  const kept = [];
+  const redone = [];
+  const cast = db.prepare('SELECT * FROM rehearsal_cast WHERE rehearsal_id = ? ORDER BY role_id').all(r.id);
+  for (const c of cast) {
+    const newScenes = new Set(
+      db
+        .prepare('SELECT DISTINCT scene_id FROM version_lines WHERE version_id = ? AND role_id = ?')
+        .all(targetVersionId, c.role_id)
+        .map((x) => x.scene_id)
+    );
+    const confirmations = db
+      .prepare('SELECT * FROM confirmations WHERE rehearsal_id = ? AND role_id = ? ORDER BY scene_id, actor_id')
+      .all(r.id, c.role_id);
+    for (const conf of confirmations) {
+      const item = {
+        actorId: conf.actor_id,
+        actorName: actorNameOf(conf.actor_id),
+        roleId: c.role_id,
+        roleName: roleNameOf(c.role_id),
+        sceneId: conf.scene_id,
+        sceneTitle: sceneTitleOf(conf.scene_id),
+        confirmedAt: conf.confirmed_at,
+      };
+      if (!newScenes.has(conf.scene_id)) {
+        redone.push({ ...item, reason: '新版本中该角色在此场次已无台词，确认将作废并重做' });
+        continue;
+      }
+      const oldHash = roleSceneHash(old, c.role_id, conf.scene_id);
+      const newHash = roleSceneHash(targetVersionId, c.role_id, conf.scene_id);
+      if (conf.content_hash !== oldHash || oldHash !== newHash) {
+        redone.push({ ...item, reason: '换版后台词文本已变化，确认将作废并重做' });
+      } else {
+        kept.push(item);
+      }
+    }
+  }
+
+  // —— 有效日程：继续有效 / 转待调整；参与演员与通知接收人变化 ——
+  const plan = planSchedulesForVersionSwitch(r.id, targetVersionId);
+  const actorBrief = (p) => ({ actorId: p.actorId, actorName: p.actorName, roles: p.roles });
+  const currentNotificationOf = (scheduleId) =>
+    db.prepare("SELECT * FROM schedule_notifications WHERE schedule_id = ? AND status = 'current'").get(scheduleId);
+  const schedules = [];
+  for (const s of plan.stillActive) {
+    const before = participantDetails(r.id, old, s.scene_id).participants;
+    const after = participantDetails(r.id, targetVersionId, s.scene_id).participants;
+    const beforeIds = new Set(before.map((p) => p.actorId));
+    const afterIds = new Set(after.map((p) => p.actorId));
+    const current = currentNotificationOf(s.id);
+    const recipientIds = current
+      ? db.prepare('SELECT actor_id FROM schedule_notification_recipients WHERE notification_id = ?').all(current.id).map((x) => x.actor_id)
+      : [];
+    schedules.push({
+      id: s.id,
+      sceneId: s.scene_id,
+      sceneTitle: sceneTitleOf(s.scene_id),
+      startAt: s.start_at,
+      endAt: s.end_at,
+      status: 'active',
+      afterStatus: 'active',
+      participantsBefore: before.map(actorBrief),
+      participantsAfter: after.map(actorBrief),
+      participantsAdded: after.filter((p) => !beforeIds.has(p.actorId)).map(actorBrief),
+      participantsRemoved: before.filter((p) => !afterIds.has(p.actorId)).map(actorBrief),
+      notification: {
+        currentSeq: current?.seq ?? null,
+        willGenerateBatch: true, // 固定版本变化即实质变化 -> 必生成新批次
+        recipientsAdded: after.filter((p) => !recipientIds.includes(p.actorId)).map(actorBrief),
+        recipientsRemoved: recipientIds
+          .filter((id) => !afterIds.has(id))
+          .map((id) => ({ actorId: id, actorName: actorNameOf(id) })),
+      },
+    });
+  }
+  for (const s of plan.needsAdjustment) {
+    const before = participantDetails(r.id, old, s.scene_id).participants;
+    const current = currentNotificationOf(s.id);
+    schedules.push({
+      id: s.id,
+      sceneId: s.scene_id,
+      sceneTitle: sceneTitleOf(s.scene_id),
+      startAt: s.start_at,
+      endAt: s.end_at,
+      status: 'active',
+      afterStatus: 'needs_adjustment',
+      participantsBefore: before.map(actorBrief),
+      participantsAfter: [],
+      participantsAdded: [],
+      participantsRemoved: before.map(actorBrief),
+      notification: {
+        currentSeq: current?.seq ?? null,
+        willGenerateBatch: false,
+        willBecomeInactive: true, // 转待调整后当前批次失效、不再待确认
+        recipientsAdded: [],
+        recipientsRemoved: [],
+      },
+    });
+  }
+
+  // —— 冲突：与其他有效日程、参与演员的不可用时段（端点相接不算；已取消与待调整不参与）——
+  const scheduleConflicts = findScheduleConflicts(plan.candidates);
+  const unavailabilityConflicts = findUnavailabilityConflicts(plan.candidates);
+
+  return {
+    fromVersion: versionBrief(old),
+    toVersion: versionBrief(targetVersionId),
+    confirmations: { kept, redone },
+    schedules,
+    needsAdjustmentSchedules: plan.needsAdjustment.map((s) => s.id),
+    conflicts: { schedule: scheduleConflicts, unavailability: unavailabilityConflicts },
+    canCommit: scheduleConflicts.length === 0 && unavailabilityConflicts.length === 0,
+  };
+}
+
+/**
+ * 换版预演状态指纹：排练版本、派角、确认、相关日程（全部日程——冲突检测跨排练）
+ * 或参与演员的不可用记录任一变化，预演即过期，须重新预演。
+ */
+function switchPreviewFingerprint(rehearsalId, targetVersionId) {
+  const r = db.prepare('SELECT version_id FROM rehearsals WHERE id = ?').get(rehearsalId);
+  const cast = db
+    .prepare('SELECT role_id, actor_id FROM rehearsal_cast WHERE rehearsal_id = ? ORDER BY role_id')
+    .all(rehearsalId);
+  const confirmations = db
+    .prepare('SELECT id, role_id, actor_id, scene_id, content_hash FROM confirmations WHERE rehearsal_id = ? ORDER BY id')
+    .all(rehearsalId);
+  const schedules = db
+    .prepare('SELECT id, rehearsal_id, scene_id, start_at, end_at, status FROM rehearsal_schedules ORDER BY id')
+    .all();
+  const actorIds = [...new Set(cast.map((c) => c.actor_id))];
+  const unavailability = actorIds.length
+    ? db
+        .prepare(
+          `SELECT id, actor_id, start_at, end_at, reason FROM actor_unavailability
+            WHERE actor_id IN (${actorIds.map(() => '?').join(',')}) ORDER BY id`
+        )
+        .all(...actorIds)
+    : [];
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({ rehearsalId, targetVersionId, versionId: r.version_id, cast, confirmations, schedules, unavailability })
+    )
+    .digest('hex');
+}
+
+/** 预演/提交共用的入参校验：导演、目标版本有效且不同于当前固定版本 */
+function parseSwitchTarget(req) {
+  if (req.user.role !== 'director') throw forbidden();
+  const r = getRehearsalOrThrow(req.params.id);
+  const targetVersionId = Number(req.body?.versionId);
+  if (!Number.isInteger(targetVersionId)) throw badRequest('必须显式指定目标版本 versionId');
+  getVersionOfPlayOrThrow(targetVersionId, r.play_id);
+  if (targetVersionId === r.version_id) throw badRequest('排练当前已固定在该版本');
+  return { r, targetVersionId };
+}
+
+// ---- 换版预演（只读：列出确认/日程/参与者与通知接收人变化及冲突，不改写任何数据） ----
+router.post(
+  '/rehearsals/:id/switch-version/preview',
+  wrap((req, res) => {
+    const { r, targetVersionId } = parseSwitchTarget(req);
+    const preview = computeSwitchPreview(r, targetVersionId);
+    res.json({
+      ok: true,
+      rehearsal: serializeRehearsal(r),
+      previewToken: switchPreviewFingerprint(r.id, targetVersionId),
+      ...preview,
+    });
+  })
+);
+
+// ---- 凭预演提交换版（预演过期拒绝；存在冲突整次不生效；成功与预演结果一致） ----
+router.post(
+  '/rehearsals/:id/switch-version/commit',
+  wrap((req, res) => {
+    const { r, targetVersionId } = parseSwitchTarget(req);
+    const previewToken = String(req.body?.previewToken || '');
+    if (!previewToken) throw badRequest('必须携带预演令牌 previewToken（请先调用换版预演接口）');
+
+    // 过期校验：预演后排练版本、派角、确认、相关日程或参与演员的不可用记录发生变化 -> 拒绝并提示重新预演
+    if (previewToken !== switchPreviewFingerprint(r.id, targetVersionId)) {
+      throw conflict(
+        'PREVIEW_STALE',
+        '预演后排练版本、派角、确认、相关日程或参与演员的不可用记录已发生变化，本次换版未生效，请重新预演'
+      );
+    }
+    // 指纹一致即以当前状态重算预演结果（与预演时相同），并复查冲突：存在冲突整次不生效
+    const preview = computeSwitchPreview(r, targetVersionId);
+    if (preview.conflicts.schedule.length) {
+      throw conflict('SCHEDULE_CONFLICT', '换版后参与演员与其他未取消时段重叠，本次换版未生效', {
+        conflicts: preview.conflicts.schedule,
+      });
+    }
+    if (preview.conflicts.unavailability.length) {
+      throw conflict('UNAVAILABILITY_CONFLICT', '换版后参与演员与其登记的不可用时段相撞，本次换版未生效', {
+        conflicts: preview.conflicts.unavailability,
+      });
+    }
+
+    let needsAdjustmentSchedules = [];
+    transaction(() => {
+      needsAdjustmentSchedules = applyVersionSwitch(r, targetVersionId, req.user.id);
+    });
+
+    res.json({
+      ok: true,
+      rehearsal: serializeRehearsal(getRehearsalOrThrow(r.id)),
+      pending: rehearsalPending(getRehearsalOrThrow(r.id), null),
+      needsAdjustmentSchedules,
+      // 与预演一致的结果：确认保留/重做、日程去向、参与演员与通知接收人变化
+      preview,
     });
   })
 );

@@ -32,6 +32,26 @@
 5. 导演页面和总览页显示每个排练的**待确认演员/角色/场次及原因**，以及最近的发布冲突详情。
 6. 演员的剧本、版本、排练稿接口均只返回其所派角色的台词；越权访问、无效版本/场次会得到明确的 `403/400/404`。
 
+### 换版预演与凭预演提交
+
+1. 导演在排练页选定**同剧已发布**的目标版本后，可先**预演换版**
+   （`POST /api/rehearsals/:id/switch-version/preview`），预演返回：
+   - 各角色 × 场次的确认将**保留**还是**重做**（与正式换版同一套文本指纹规则）；
+   - 各**有效日程**将**继续有效**还是**转为待调整**；
+   - 各时段**参与演员与通知接收人**的前后名单与增减（转待调整的时段其当前通知批次将失效）；
+   - 与**其他有效日程**或**演员不可用时段**的冲突——**端点相接不算冲突**，
+     **已取消和待调整日程不参与**；无冲突时 `canCommit=true`。
+2. 预演为**纯只读**：不改写版本、确认、日程、签到快照或通知。
+3. 导演凭预演返回的 `previewToken` **提交换版**
+   （`POST /api/rehearsals/:id/switch-version/commit`）：
+   - 若预演后**排练版本、派角、确认、相关日程或参与演员的不可用记录**发生变化，
+     提交被拒绝（`409 PREVIEW_STALE`）并提示**重新预演**；
+   - 若存在冲突，**整次换版不生效**并返回冲突详情
+     （`409 SCHEDULE_CONFLICT` / `UNAVAILABILITY_CONFLICT`，`details.conflicts` 结构同现有接口）；
+   - 成功提交**与预演结果一致**（响应含 `preview` 字段），沿用现有换版的确认、日程与通知语义，
+     已开启的签到快照保持不变。
+4. 原 `POST /api/rehearsals/:id/switch-version` 接口及响应**保持可用**，语义不变。
+
 ### 排练日程（带时区时段）
 
 1. 导演可为已有排练的**某场次**安排**多段**带时区的起止时间
@@ -181,7 +201,9 @@ PORT=8080 docker compose up --build -d
 - **导演 → 剧本与版本**：建剧本、加场次/角色、录入草稿台词、发布首版、查看各版本快照。
 - **导演 → 修订发布**：选基准版本建修订、逐条添加改/增/删（界面可一键填入所选台词原文）、
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
-- **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
+- **导演 → 排练与确认**：创建固定版本的排练、显式换版（可先做**预演换版**：查看确认保留/重做、
+  日程继续有效或转待调整、参与演员与通知接收人变化及冲突，再凭预演令牌一键提交；预演后相关状态变化会提示重新预演）、
+  派角/改派，查看待确认清单与冲突；
   为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；勾选至少两条未取消时段可**批量调整**
   （整批校验冲突，成功后提示有实质变化并重发通知的条数，未变化不重发）；对有效时段**开启/查看/关闭到场登记**
   （名单、缺口、应到/签到/缺席统计）；在“知悉通知”列查看各时段**当前批次的已确认/待确认名单与
@@ -211,6 +233,8 @@ PORT=8080 docker compose up --build -d
 | POST/GET | `/api/plays/:id/rehearsals` · `/api/rehearsals` | 建排练 / 列表 |
 | GET | `/api/rehearsals/:id` | 派角、待确认、换版历史、最近冲突 |
 | POST | `/api/rehearsals/:id/switch-version` | 显式换版 |
+| POST | `/api/rehearsals/:id/switch-version/preview` | 预演换版（导演，只读）：确认保留/重做、日程去向、参与演员与通知接收人变化、冲突；返回 `previewToken` |
+| POST | `/api/rehearsals/:id/switch-version/commit` | 凭预演提交换版（导演）：预演后相关状态变化 `409 PREVIEW_STALE`；冲突整次不生效；成功与预演一致 |
 | POST/DELETE | `/api/rehearsals/:id/cast[/:roleId]` | 派角/改派/取消 |
 | GET | `/api/rehearsals/:id/script` | 演员排练稿（仅本人角色） |
 | POST | `/api/rehearsals/:id/confirm` | 演员逐场确认 |
@@ -232,7 +256,7 @@ PORT=8080 docker compose up --build -d
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
-`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`）。
+`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`）。
 
 日程列表响应（导演与演员）均带 `notification` 摘要：导演见 `{id, seq, status, expected, confirmed, pending}`
 （仅当前批次计 `pending`）；演员见 `{id, seq, myState, confirmedAt}`（本人不在当前批次接收人中或无批次时为 `null`）。
@@ -290,6 +314,61 @@ curl -s "http://localhost:3000/api/rehearsals/1/schedules" \
 派角/改派（`POST /api/rehearsals/:id/cast`）与显式换版（`POST /api/rehearsals/:id/switch-version`）
 同样做日程冲突校验：若新的参与演员与其他未取消时段重叠，返回 `409 SCHEDULE_CONFLICT` 且整次操作不生效
 （换版失败时版本与确认均不变）；换版成功时响应新增 `needsAdjustmentSchedules`（被标为待调整的时段 id 列表）。
+
+## 换版预演与提交接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 预演换版（只读，不改写任何数据）：目标版本须为同剧已发布版本
+curl -s -X POST http://localhost:3000/api/rehearsals/1/switch-version/preview \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"versionId":2}'
+# -> {"ok":true,"canCommit":true,"previewToken":"<PREVIEW_TOKEN>",
+#     "fromVersion":{"id":1,"versionNo":1},"toVersion":{"id":2,"versionNo":2},
+#     "confirmations":{
+#       "kept":[{"actorId":2,"actorName":"林晚","roleName":"守塔人","sceneTitle":"II 灯塔之下",...}],
+#       "redone":[{"actorId":2,"actorName":"林晚","roleName":"守塔人","sceneTitle":"I 风暴前夜",
+#                  "reason":"换版后台词文本已变化，确认将作废并重做",...}]},
+#     "schedules":[{"id":1,"afterStatus":"active",
+#        "participantsBefore":[...],"participantsAfter":[...],
+#        "participantsAdded":[],"participantsRemoved":[],
+#        "notification":{"currentSeq":1,"willGenerateBatch":true,
+#          "recipientsAdded":[],"recipientsRemoved":[]}}, ...],
+#     "needsAdjustmentSchedules":[],          <- 将转为待调整的时段 id
+#     "conflicts":{"schedule":[],"unavailability":[]}}
+#    - 转待调整的时段 afterStatus="needs_adjustment"，其 notification.willBecomeInactive=true；
+#    - 冲突（若有）在 conflicts.schedule / conflicts.unavailability 中逐条列出
+#      （结构同 409 响应的 details.conflicts），此时 canCommit=false；
+#    - 预演后版本、确认、日程、签到快照与通知均不变。
+
+# 3. 凭预演令牌提交换版：成功结果与预演一致（响应含原换版字段 + preview 快照）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/switch-version/commit \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"versionId":2,"previewToken":"<PREVIEW_TOKEN>"}'
+# -> {"ok":true,"rehearsal":{"id":1,"versionId":2,"versionNo":2,...},
+#     "pending":[...],"needsAdjustmentSchedules":[],
+#     "preview":{"fromVersion":{...},"toVersion":{...},
+#       "confirmations":{"kept":[...],"redone":[...]},"schedules":[...], ...}}
+
+# 4. 预演后相关状态变化（排练版本/派角/确认/相关日程/参与演员不可用记录）-> 过期拒绝
+curl -s -X POST http://localhost:3000/api/rehearsals/1/switch-version/commit \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"versionId":2,"previewToken":"<过期令牌>"}'
+# -> 409 {"error":"PREVIEW_STALE",
+#        "message":"预演后排练版本、派角、确认、相关日程或参与演员的不可用记录已发生变化，本次换版未生效，请重新预演"}
+#    缺少 previewToken -> 400；令牌不匹配同样 409 PREVIEW_STALE；此时重新预演再提交即可。
+
+# 5. 提交时仍存在冲突（如预演后其他排练的派角变化引入重叠）-> 整次不生效并返回冲突详情
+# -> 409 {"error":"SCHEDULE_CONFLICT","message":"换版后参与演员与其他未取消时段重叠，本次换版未生效",
+#        "details":{"conflicts":[{"actorId":2,"actorName":"林晚",
+#          "schedule":{"id":5,...},"overlapsWith":{"id":9,"rehearsalId":3,...}}]}}
+#    不可用时段冲突同理返回 409 UNAVAILABILITY_CONFLICT；版本、确认、日程与通知均不变。
+```
 
 ## 批量调整时段接口调用示例（curl）
 
@@ -515,6 +594,8 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
 多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效、
+换版预演与凭预演提交（确认保留/重做、日程去向、参与者与通知接收人变化、预演只读、
+预演后版本/派角/确认/日程/不可用变化即过期拒绝、提交时冲突整次不生效、成功与预演一致、签到快照不变）、
 日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性、
 批量调整（入参拒绝：重复/跨排练/已取消/无台词/无效时间/空批次；两条互换时间成功；批内/跨排练/不可用冲突整批回滚；
 端点相接；无实质变化不重发通知；保持到场登记快照；待调整随批恢复有效）、
@@ -541,7 +622,7 @@ src/
   auth.js          登录/会话/鉴权
   plays.js         剧本、场次、角色、台词、版本
   revisions.js     修订与发布（冲突检测核心）
-  rehearsals.js    排练、派角、换版、逐场确认
+  rehearsals.js    排练、派角、换版（含预演与凭预演提交）、逐场确认
   schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突与不可用时段检测、取消联动登记、
                    时段通知批次生成：随排期/调期/取消/派角/换版事务提交）
   attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
